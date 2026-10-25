@@ -7,6 +7,7 @@ import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -21,22 +22,84 @@ import com.flipfinder.dto.ItemHistoryDto;
 import com.flipfinder.service.FlipQuery.PriceBasis;
 
 import java.io.IOException;
+import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
+import java.time.ZoneId;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.function.Consumer;
 
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+import org.mockito.stubbing.Answer;
 
 class ChatServiceTests {
+    private static final Duration STARTUP_WAIT = Duration.ofSeconds(90);
+    private static final Duration STARTUP_POLL = Duration.ofSeconds(2);
+
     private final LlmClient llm = mock(LlmClient.class);
     private final FlipService flips = mock(FlipService.class);
     private final AccountService accounts = mock(AccountService.class);
-    private final ChatService chat = new ChatService(llm, flips, accounts, Optional.empty(), new ObjectMapper());
+    private final FakeTime time = new FakeTime();
+    private final ChatService chat = chat(Optional.empty());
     private final List<Map<String, Object>> events = new ArrayList<>();
+
+    /**
+     * A clock that only moves when the chat sleeps, so waiting for the model
+     * to start takes no real time and the waits can be counted.
+     */
+    private static final class FakeTime extends Clock implements ChatService.Sleeper {
+        private Instant now = Instant.parse("2026-10-24T12:00:00Z");
+        private final List<Duration> sleeps = new ArrayList<>();
+
+        @Override
+        public void sleep(Duration duration) {
+            sleeps.add(duration);
+            now = now.plus(duration);
+        }
+
+        @Override
+        public Instant instant() {
+            return now;
+        }
+
+        @Override
+        public ZoneId getZone() {
+            return ZoneOffset.UTC;
+        }
+
+        @Override
+        public Clock withZone(ZoneId zone) {
+            return this;
+        }
+    }
+
+    private ChatService chat(Optional<PriceHistoryService> history) {
+        return new ChatService(llm, flips, accounts, history, new ObjectMapper(), STARTUP_WAIT, STARTUP_POLL,
+                time, time);
+    }
+
+    @BeforeEach
+    void modelIsReady() throws Exception {
+        when(llm.health()).thenReturn(LlmClient.Health.READY);
+    }
+
+    private static LlmClient.Reply answer(String text) {
+        return new LlmClient.Reply(text, List.of(), "stop");
+    }
+
+    /** Streams the text as the model would, then returns it as the whole reply. */
+    private static Answer<LlmClient.Reply> streams(String text) {
+        return invocation -> {
+            invocation.<Consumer<String>>getArgument(2).accept(text);
+            return answer(text);
+        };
+    }
 
     private static ChatRequest ask(Long account, String question) {
         ChatRequest request = new ChatRequest();
@@ -212,7 +275,7 @@ class ChatServiceTests {
     @SuppressWarnings("unchecked")
     void looksUpAnItemsHistoryWhenHistoryIsKept() throws Exception {
         PriceHistoryService history = mock(PriceHistoryService.class);
-        ChatService chat = new ChatService(llm, flips, accounts, Optional.of(history), new ObjectMapper());
+        ChatService chat = chat(Optional.of(history));
         ItemDto leaf = FlipCalculatorTests.item();
         ItemHistoryDto summary = new ItemHistoryDto();
         summary.name = "Gold leaf";
@@ -250,5 +313,110 @@ class ChatServiceTests {
         chat.chat(ask(null, "What should I flip?"), events::add);
 
         assertThat(events).extracting(event -> event.get("type")).containsExactly("error", "done");
+        assertThat(events.getFirst()).containsEntry("message", ChatService.UNREACHABLE_MESSAGE);
+        assertThat(time.sleeps).isEmpty();
+    }
+
+    @Test
+    void asksAReadyModelWithoutWaiting() throws Exception {
+        when(llm.complete(anyList(), anyList(), any())).thenAnswer(streams("Flip gold leaf."));
+
+        chat.chat(ask(null, "What should I flip?"), events::add);
+
+        assertThat(events).extracting(event -> event.get("type")).containsExactly("text", "done");
+        assertThat(time.sleeps).isEmpty();
+        verify(llm, times(1)).health();
+    }
+
+    @Test
+    void waitsForAModelThatIsStillLoading() throws Exception {
+        // Checked before asking, then every two seconds: loading twice more, then ready.
+        when(llm.health()).thenReturn(LlmClient.Health.STARTING, LlmClient.Health.STARTING,
+                LlmClient.Health.STARTING, LlmClient.Health.READY);
+        when(llm.complete(anyList(), anyList(), any())).thenAnswer(streams("Flip gold leaf."));
+
+        chat.chat(ask(null, "What should I flip?"), events::add);
+
+        assertThat(events).extracting(event -> event.get("type")).containsExactly("status", "text", "done");
+        assertThat(events.getFirst()).containsEntry("message", ChatService.STARTING_MESSAGE);
+        assertThat(time.sleeps).containsExactly(STARTUP_POLL, STARTUP_POLL, STARTUP_POLL);
+        verify(llm, times(4)).health();
+        verify(llm, times(1)).complete(anyList(), anyList(), any());
+    }
+
+    @Test
+    void givesUpOnAModelThatNeverFinishesStarting() throws Exception {
+        when(llm.health()).thenReturn(LlmClient.Health.STARTING);
+
+        chat.chat(ask(null, "What should I flip?"), events::add);
+
+        assertThat(events).extracting(event -> event.get("type")).containsExactly("status", "error", "done");
+        assertThat(events.get(1)).containsEntry("message", ChatService.STILL_STARTING_MESSAGE);
+        // It waits the whole 90 seconds, two at a time, and never sends the question.
+        assertThat(time.sleeps).hasSize(45).allMatch(STARTUP_POLL::equals);
+        verify(llm, never()).complete(anyList(), anyList(), any());
+    }
+
+    @Test
+    void waitsWhenTheModelRefusesTheQuestionWhileStarting() throws Exception {
+        // The health check missed the start, as when the model stopped just after it,
+        // so the refused connection is what shows it is starting.
+        when(llm.health()).thenReturn(LlmClient.Health.READY, LlmClient.Health.STARTING, LlmClient.Health.READY);
+        when(llm.complete(anyList(), anyList(), any()))
+                .thenThrow(new LlmClient.StartingException("Connection refused", null))
+                .thenAnswer(streams("Flip gold leaf."));
+
+        chat.chat(ask(null, "What should I flip?"), events::add);
+
+        assertThat(events).extracting(event -> event.get("type")).containsExactly("status", "text", "done");
+        assertThat(events.get(1)).containsEntry("text", "Flip gold leaf.");
+        assertThat(time.sleeps).containsExactly(STARTUP_POLL, STARTUP_POLL);
+        verify(llm, times(2)).complete(anyList(), anyList(), any());
+    }
+
+    @Test
+    void waitsForTheModelOnlyOncePerAnswer() throws Exception {
+        when(llm.health()).thenReturn(LlmClient.Health.STARTING, LlmClient.Health.READY);
+        when(llm.complete(anyList(), anyList(), any()))
+                .thenThrow(new LlmClient.StartingException("The language model returned HTTP 503", null));
+
+        chat.chat(ask(null, "What should I flip?"), events::add);
+
+        assertThat(events).extracting(event -> event.get("type")).containsExactly("status", "error", "done");
+        assertThat(events.get(1)).containsEntry("message", ChatService.STILL_STARTING_MESSAGE);
+        verify(llm, times(1)).complete(anyList(), anyList(), any());
+    }
+
+    @Test
+    void asksAnywayWhenTheHealthCheckStopsSayingStarting() throws Exception {
+        // A server without a health check, or one that answers it oddly, gets the question
+        // and fails or answers as it would have without the wait.
+        when(llm.health()).thenReturn(LlmClient.Health.STARTING, LlmClient.Health.UNKNOWN);
+        when(llm.complete(anyList(), anyList(), any())).thenThrow(new IOException("HTTP 500"));
+
+        chat.chat(ask(null, "What should I flip?"), events::add);
+
+        assertThat(events).extracting(event -> event.get("type")).containsExactly("status", "error", "done");
+        assertThat(events.get(1)).containsEntry("message", ChatService.UNREACHABLE_MESSAGE);
+        assertThat(time.sleeps).containsExactly(STARTUP_POLL);
+    }
+
+    @Test
+    void stopsWaitingWhenInterrupted() throws Exception {
+        when(llm.health()).thenReturn(LlmClient.Health.STARTING);
+        ChatService chat = new ChatService(llm, flips, accounts, Optional.empty(), new ObjectMapper(),
+                STARTUP_WAIT, STARTUP_POLL, time, duration -> {
+                    throw new InterruptedException();
+                });
+
+        try {
+            chat.chat(ask(null, "What should I flip?"), events::add);
+
+            assertThat(events).extracting(event -> event.get("type")).containsExactly("status", "error", "done");
+            assertThat(events.get(1)).containsEntry("message", "The answer was interrupted.");
+            assertThat(Thread.currentThread().isInterrupted()).isTrue();
+        } finally {
+            Thread.interrupted();
+        }
     }
 }

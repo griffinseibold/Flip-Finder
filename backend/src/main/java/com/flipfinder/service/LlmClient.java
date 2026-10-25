@@ -4,10 +4,14 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
 import java.io.IOException;
+import java.net.ConnectException;
 import java.net.URI;
+import java.net.UnknownHostException;
 import java.net.http.HttpClient;
+import java.net.http.HttpConnectTimeoutException;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.channels.UnresolvedAddressException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -17,32 +21,152 @@ import java.util.TreeMap;
 import java.util.function.Consumer;
 import java.util.stream.Stream;
 
+import com.flipfinder.config.ChatEnabledCondition;
+
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.context.annotation.Conditional;
 import org.springframework.stereotype.Component;
 
 /**
  * Streams chat completions from an OpenAI-compatible server, such as the
- * homelab's llama.cpp.
+ * homelab's llama.cpp, and checks whether that server is ready to answer.
  */
 @Component
-@ConditionalOnProperty(name = "flipfinder.llm.base-url")
+@Conditional(ChatEnabledCondition.class)
 public class LlmClient {
     private final ObjectMapper mapper;
     private final URI completionsUri;
+    private final URI healthUri;
     private final String model;
     private final HttpClient http = HttpClient.newBuilder()
             .version(HttpClient.Version.HTTP_1_1)
             .connectTimeout(Duration.ofSeconds(10))
             .build();
+    // The readiness check is polled while the model starts, so it gives up on
+    // a connection sooner than an answer does: a stopped server should cost a
+    // poll a couple of seconds, not ten.
+    private final HttpClient healthHttp = HttpClient.newBuilder()
+            .version(HttpClient.Version.HTTP_1_1)
+            .connectTimeout(Duration.ofSeconds(2))
+            .build();
 
     public LlmClient(
             ObjectMapper mapper,
             @Value("${flipfinder.llm.base-url}") String baseUrl,
+            @Value("${flipfinder.llm.health-url:}") String healthUrl,
             @Value("${flipfinder.llm.model:}") String model) {
         this.mapper = mapper;
-        this.completionsUri = URI.create(baseUrl.replaceFirst("/+$", "") + "/chat/completions");
+        this.completionsUri = absolute(trimSlashes(baseUrl) + "/chat/completions", "flipfinder.llm.base-url");
+        this.healthUri = healthUri(baseUrl, healthUrl);
         this.model = model;
+    }
+
+    /**
+     * Where the server reports whether it is ready. llama.cpp serves its
+     * OpenAI-compatible API under /v1 but its health check at the root, so
+     * http://llama-server.llm.svc.cluster.local/v1 is checked at
+     * http://llama-server.llm.svc.cluster.local/health. Set
+     * flipfinder.llm.health-url for a server laid out differently.
+     */
+    static URI healthUri(String baseUrl, String healthUrl) {
+        if (healthUrl != null && !healthUrl.isBlank()) {
+            return absolute(healthUrl.trim(), "flipfinder.llm.health-url");
+        }
+        String root = trimSlashes(baseUrl).replaceFirst("/v1$", "");
+        return absolute(root + "/health", "flipfinder.llm.base-url");
+    }
+
+    private static String trimSlashes(String url) {
+        return url.trim().replaceFirst("/+$", "");
+    }
+
+    /**
+     * Fails at startup on a URL the client could never reach, such as one
+     * missing its http://, rather than on the first question.
+     */
+    private static URI absolute(String url, String property) {
+        URI uri;
+        try {
+            uri = URI.create(url);
+        } catch (IllegalArgumentException e) {
+            throw new IllegalArgumentException(property + " is not a valid URL: " + url, e);
+        }
+        if (!("http".equals(uri.getScheme()) || "https".equals(uri.getScheme())) || uri.getHost() == null) {
+            throw new IllegalArgumentException(property + " must be an http:// or https:// URL, not " + url);
+        }
+        return uri;
+    }
+
+    URI healthUri() {
+        return healthUri;
+    }
+
+    /** Whether the server can answer now, as far as its health check tells. */
+    public enum Health {
+        /** The health check answered 200. */
+        READY,
+        /**
+         * The server is loading its model (HTTP 503) or is not running yet
+         * (connection refused or timed out): the homelab starts it on demand,
+         * so it should be ready shortly.
+         */
+        STARTING,
+        /**
+         * The health check said nothing useful, such as a 404 from a server
+         * without one or a host that does not resolve. The question is sent
+         * anyway, so such a server fails or answers exactly as it did before
+         * there was a health check.
+         */
+        UNKNOWN
+    }
+
+    /** Asks the server whether it is ready, without waiting for it. */
+    public Health health() throws InterruptedException {
+        HttpRequest request = HttpRequest.newBuilder(healthUri)
+                .timeout(Duration.ofSeconds(5))
+                .GET()
+                .build();
+        try {
+            int status = healthHttp.send(request, HttpResponse.BodyHandlers.discarding()).statusCode();
+            if (status == 200) {
+                return Health.READY;
+            }
+            return status == 503 ? Health.STARTING : Health.UNKNOWN;
+        } catch (IOException e) {
+            return startingFailure(e) ? Health.STARTING : Health.UNKNOWN;
+        }
+    }
+
+    /**
+     * Whether a failed request means the server is not running yet. Inside the
+     * cluster a stopped server's Service refuses connections or lets them time
+     * out; outside it, through the Gateway, it answers 503 instead. A host
+     * that does not resolve is left out: the homelab keeps the Service while
+     * the model is stopped, so a missing name is a wrong URL, not a start, and
+     * fails at once as it always has.
+     */
+    static boolean startingFailure(IOException e) {
+        if (!(e instanceof ConnectException || e instanceof HttpConnectTimeoutException)) {
+            return false;
+        }
+        for (Throwable cause = e; cause != null; cause = cause.getCause()) {
+            if (cause instanceof UnresolvedAddressException || cause instanceof UnknownHostException) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * A request failed because the server is not running yet or is still
+     * loading its model, as opposed to failing while it answered.
+     */
+    public static class StartingException extends IOException {
+        private static final long serialVersionUID = 1L;
+
+        public StartingException(String message, Throwable cause) {
+            super(message, cause);
+        }
     }
 
     /**
@@ -72,9 +196,20 @@ public class LlmClient {
                 .timeout(Duration.ofMinutes(3))
                 .POST(HttpRequest.BodyPublishers.ofString(mapper.writeValueAsString(body)))
                 .build();
-        HttpResponse<Stream<String>> response = http.send(request, HttpResponse.BodyHandlers.ofLines());
+        HttpResponse<Stream<String>> response;
+        try {
+            response = http.send(request, HttpResponse.BodyHandlers.ofLines());
+        } catch (IOException e) {
+            if (startingFailure(e)) {
+                throw new StartingException("The language model is not running yet: " + e, e);
+            }
+            throw e;
+        }
 
         try (Stream<String> lines = response.body()) {
+            if (response.statusCode() == 503) {
+                throw new StartingException("The language model returned HTTP 503 while loading", null);
+            }
             if (response.statusCode() != 200) {
                 throw new IOException("The language model returned HTTP " + response.statusCode());
             }

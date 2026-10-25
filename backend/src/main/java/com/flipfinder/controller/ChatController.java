@@ -1,6 +1,7 @@
 package com.flipfinder.controller;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.flipfinder.config.ChatEnabledCondition;
 import com.flipfinder.dto.ChatRequest;
 import com.flipfinder.service.ChatService;
 
@@ -11,7 +12,7 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.io.UncheckedIOException;
 
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.context.annotation.Conditional;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
@@ -21,9 +22,12 @@ import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.server.ResponseStatusException;
 import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody;
 
-/** Chat with the homelab's language model. Configuring flipfinder.llm.base-url enables it. */
+/**
+ * Chat with the homelab's language model. Setting flipfinder.llm.enabled and
+ * flipfinder.llm.base-url enables it; see {@link ChatEnabledCondition}.
+ */
 @RestController
-@ConditionalOnProperty(name = "flipfinder.llm.base-url")
+@Conditional(ChatEnabledCondition.class)
 @Tag(name = "Chat", description = "Ask the homelab's language model about flips")
 public class ChatController {
 	static final MediaType NDJSON = MediaType.parseMediaType("application/x-ndjson");
@@ -39,9 +43,10 @@ public class ChatController {
 
 	@PostMapping(value = "/api/chat", produces = "application/x-ndjson")
 	@Operation(summary = "Ask about flips", description = """
-			Answers the conversation's last message as newline-delimited JSON events: "tool" when the model \
-			starts looking up flips, "flips" with what it found, "text" pieces of the answer as they are \
-			written, then "done". An "error" event means the model could not answer.""")
+			Answers the conversation's last message as newline-delimited JSON events: "status" when the \
+			answer waits for the model to start, "tool" when the model starts looking up flips, "flips" with \
+			what it found, "text" pieces of the answer as they are written, then "done". An "error" event \
+			means the model could not answer.""")
 	public ResponseEntity<StreamingResponseBody> chat(@RequestBody ChatRequest request) {
 		if (request.messages == null || request.messages.isEmpty()
 				|| !"user".equals(request.messages.getLast().role)) {

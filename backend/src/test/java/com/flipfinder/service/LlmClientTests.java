@@ -10,9 +10,12 @@ import com.sun.net.httpserver.HttpServer;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
+import java.net.ServerSocket;
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import org.junit.jupiter.api.AfterEach;
@@ -21,11 +24,20 @@ import org.junit.jupiter.api.Test;
 class LlmClientTests {
     private final ObjectMapper mapper = new ObjectMapper();
     private final AtomicReference<String> requestBody = new AtomicReference<>();
+    // What the stand-in's /health answers: 200 when llama.cpp is ready, 503 while it loads the model.
+    private final AtomicInteger healthStatus = new AtomicInteger(200);
     private HttpServer server;
 
-    /** Starts a server that answers /v1/chat/completions with the given status and event-stream lines. */
+    /**
+     * Starts a server that answers /v1/chat/completions with the given status
+     * and event-stream lines, and /health with {@link #healthStatus}.
+     */
     private LlmClient serve(int status, String... events) throws IOException {
         server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.createContext("/health", exchange -> {
+            exchange.sendResponseHeaders(healthStatus.get(), -1);
+            exchange.close();
+        });
         server.createContext("/v1/chat/completions", exchange -> {
             requestBody.set(new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
             exchange.getResponseHeaders().add("Content-Type", "text/event-stream");
@@ -38,7 +50,16 @@ class LlmClientTests {
             }
         });
         server.start();
-        return new LlmClient(mapper, "http://127.0.0.1:" + server.getAddress().getPort() + "/v1/", "");
+        return new LlmClient(mapper, "http://127.0.0.1:" + server.getAddress().getPort() + "/v1/", "", "");
+    }
+
+    /** A client for a port nothing listens on, like the homelab's model before it starts. */
+    private LlmClient stopped() throws IOException {
+        int port;
+        try (ServerSocket socket = new ServerSocket(0)) {
+            port = socket.getLocalPort();
+        }
+        return new LlmClient(mapper, "http://127.0.0.1:" + port + "/v1", "", "");
     }
 
     @AfterEach
@@ -98,10 +119,89 @@ class LlmClientTests {
 
     @Test
     void failsWhenTheServerReturnsAnError() throws Exception {
-        LlmClient client = serve(503);
+        LlmClient client = serve(500);
 
         assertThatThrownBy(() -> client.complete(List.of(LlmClient.message("user", "Hi")), List.of(), text -> { }))
                 .isInstanceOf(IOException.class)
+                .isNotInstanceOf(LlmClient.StartingException.class)
+                .hasMessageContaining("500");
+    }
+
+    @Test
+    void treatsA503AsAModelStillLoading() throws Exception {
+        LlmClient client = serve(503);
+
+        assertThatThrownBy(() -> client.complete(List.of(LlmClient.message("user", "Hi")), List.of(), text -> { }))
+                .isInstanceOf(LlmClient.StartingException.class)
                 .hasMessageContaining("503");
+    }
+
+    @Test
+    void treatsARefusedConnectionAsAModelNotStartedYet() throws Exception {
+        LlmClient client = stopped();
+
+        assertThatThrownBy(() -> client.complete(List.of(LlmClient.message("user", "Hi")), List.of(), text -> { }))
+                .isInstanceOf(LlmClient.StartingException.class);
+        assertThat(client.health()).isEqualTo(LlmClient.Health.STARTING);
+    }
+
+    @Test
+    void reportsHealthFromTheServersHealthCheck() throws Exception {
+        LlmClient client = serve(200);
+
+        assertThat(client.health()).isEqualTo(LlmClient.Health.READY);
+        healthStatus.set(503);
+        assertThat(client.health()).isEqualTo(LlmClient.Health.STARTING);
+        // Anything else says nothing about starting, so the question is sent as before.
+        healthStatus.set(404);
+        assertThat(client.health()).isEqualTo(LlmClient.Health.UNKNOWN);
+    }
+
+    @Test
+    void doesNotMistakeAWrongHostForAStartingModel() throws Exception {
+        // The homelab keeps the model's Service while it is stopped, so a name that does
+        // not resolve is a wrong URL: it should fail at once rather than wait 90 seconds.
+        LlmClient client = new LlmClient(mapper, "http://no-such-host.invalid/v1", "", "");
+
+        assertThat(client.health()).isEqualTo(LlmClient.Health.UNKNOWN);
+        assertThatThrownBy(() -> client.complete(List.of(LlmClient.message("user", "Hi")), List.of(), text -> { }))
+                .isInstanceOf(IOException.class)
+                .isNotInstanceOf(LlmClient.StartingException.class);
+    }
+
+    @Test
+    void checksHealthAtTheServerRootWithoutTheApiPath() {
+        assertThat(LlmClient.healthUri("http://llama-server.llm.svc.cluster.local/v1", ""))
+                .isEqualTo(URI.create("http://llama-server.llm.svc.cluster.local/health"));
+        assertThat(LlmClient.healthUri("http://llm.localhost:8080/v1/", null))
+                .isEqualTo(URI.create("http://llm.localhost:8080/health"));
+        assertThat(LlmClient.healthUri("http://127.0.0.1:8080", " "))
+                .isEqualTo(URI.create("http://127.0.0.1:8080/health"));
+        // Only a trailing /v1 is the API's; the rest of the path is where the server lives.
+        assertThat(LlmClient.healthUri("https://example.com/llama/v1", ""))
+                .isEqualTo(URI.create("https://example.com/llama/health"));
+        assertThat(LlmClient.healthUri("http://example.com/v1beta", ""))
+                .isEqualTo(URI.create("http://example.com/v1beta/health"));
+    }
+
+    @Test
+    void usesAHealthUrlSetExplicitly() {
+        assertThat(LlmClient.healthUri("http://example.com/v1", "http://example.com/ready"))
+                .isEqualTo(URI.create("http://example.com/ready"));
+        assertThat(new LlmClient(mapper, "http://example.com/v1", "http://example.com/ready", "").healthUri())
+                .isEqualTo(URI.create("http://example.com/ready"));
+    }
+
+    @Test
+    void refusesAUrlItCouldNeverReach() {
+        assertThatThrownBy(() -> new LlmClient(mapper, "", "", ""))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("flipfinder.llm.base-url");
+        assertThatThrownBy(() -> new LlmClient(mapper, "llama-server.llm.svc.cluster.local/v1", "", ""))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("flipfinder.llm.base-url");
+        assertThatThrownBy(() -> new LlmClient(mapper, "http://example.com/v1", "/health", ""))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("flipfinder.llm.health-url");
     }
 }

@@ -18,6 +18,8 @@ import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -33,10 +35,13 @@ import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
 
-@SpringBootTest(properties = { "flipfinder.scheduling.enabled=false", "flipfinder.runelite.enabled=true" })
+@SpringBootTest(properties = { "flipfinder.scheduling.enabled=false", "flipfinder.runelite.enabled=true",
+		"flipfinder.llm.enabled=true", "flipfinder.llm.startup-poll=10ms" })
 @AutoConfigureMockMvc
 class ChatApiTests {
 	private static HttpServer llm;
+	// How many more health checks answer 503, as llama.cpp does while it loads the model.
+	private static final AtomicInteger loadingChecks = new AtomicInteger();
 
 	@Autowired
 	private MockMvc mockMvc;
@@ -50,6 +55,10 @@ class ChatApiTests {
 	@BeforeAll
 	static void startLanguageModel() throws IOException {
 		llm = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+		llm.createContext("/health", exchange -> {
+			exchange.sendResponseHeaders(loadingChecks.getAndUpdate(n -> Math.max(n - 1, 0)) > 0 ? 503 : 200, -1);
+			exchange.close();
+		});
 		llm.createContext("/v1/chat/completions", exchange -> {
 			String body = new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
 			List<String> events = body.contains("tool_call_id")
@@ -82,6 +91,7 @@ class ChatApiTests {
 
 	@BeforeEach
 	void items() {
+		loadingChecks.set(0);
 		jdbc.update("DELETE FROM items");
 		long now = Instant.now().getEpochSecond();
 		jdbc.update("""
@@ -94,22 +104,25 @@ class ChatApiTests {
 
 	@Test
 	void streamsAnAnswerBuiltOnAFlipLookup() throws Exception {
-		MvcResult started = mockMvc.perform(post("/api/chat")
-				.contentType(MediaType.APPLICATION_JSON)
-				.content("{\"messages\":[{\"role\":\"user\",\"content\":\"Is gold leaf a good flip?\"}]}"))
-				.andExpect(request().asyncStarted())
-				.andReturn();
+		List<JsonNode> events = ask("Is gold leaf a good flip?");
 
-		String body = mockMvc.perform(asyncDispatch(started))
-				.andExpect(status().isOk())
-				.andReturn().getResponse().getContentAsString();
-
-		List<JsonNode> events = body.lines().map(this::parse).toList();
 		assertThat(events).extracting(event -> event.path("type").asText())
 				.containsExactly("tool", "flips", "text", "text", "done");
 		assertThat(events.get(1).path("items").get(0).path("item").path("name").asText()).isEqualTo("Gold leaf");
 		assertThat(events.get(2).path("text").asText() + events.get(3).path("text").asText())
 				.isEqualTo("Gold leaf looks good.");
+	}
+
+	@Test
+	void waitsForTheModelToLoadThenAnswers() throws Exception {
+		loadingChecks.set(3);
+
+		List<JsonNode> events = ask("Is gold leaf a good flip?");
+
+		assertThat(events).extracting(event -> event.path("type").asText())
+				.containsExactly("status", "tool", "flips", "text", "text", "done");
+		assertThat(events.getFirst().path("message").asText()).contains("is starting");
+		assertThat(loadingChecks).hasValue(0);
 	}
 
 	@Test
@@ -125,6 +138,20 @@ class ChatApiTests {
 		mockMvc.perform(get("/api/features"))
 				.andExpect(jsonPath("$.chat").value(true))
 				.andExpect(jsonPath("$.runelite").value(true));
+	}
+
+	private List<JsonNode> ask(String question) throws Exception {
+		MvcResult started = mockMvc.perform(post("/api/chat")
+				.contentType(MediaType.APPLICATION_JSON)
+				.content(mapper.writeValueAsString(
+						Map.of("messages", List.of(Map.of("role", "user", "content", question))))))
+				.andExpect(request().asyncStarted())
+				.andReturn();
+
+		String body = mockMvc.perform(asyncDispatch(started))
+				.andExpect(status().isOk())
+				.andReturn().getResponse().getContentAsString();
+		return body.lines().map(this::parse).toList();
 	}
 
 	private JsonNode parse(String line) {

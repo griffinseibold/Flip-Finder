@@ -1,9 +1,12 @@
 package com.flipfinder.controller;
 
+import com.flipfinder.service.ChatService;
+
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
 
 import java.util.Map;
+import java.util.Optional;
 
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -18,8 +21,10 @@ public class FeaturesController {
 	public FeaturesController(
 			@Value("${flipfinder.runelite.enabled:false}") boolean runelite,
 			@Value("${flipfinder.history.enabled:false}") boolean history,
-			@Value("${flipfinder.llm.base-url:}") String llmBaseUrl) {
-		this.features = Map.of("runelite", runelite, "history", history, "chat", !llmBaseUrl.isBlank());
+			Optional<ChatService> chat) {
+		// The chat is reported on exactly when its service exists, so the web app
+		// never offers a chat whose endpoint is missing.
+		this.features = Map.of("runelite", runelite, "history", history, "chat", chat.isPresent());
 	}
 
 	@GetMapping("/api/features")
