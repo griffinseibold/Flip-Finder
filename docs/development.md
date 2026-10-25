@@ -54,8 +54,10 @@ database, and a Spring profile chooses where it lives:
   endpoints that receive data from the RuneLite plugin
   (`flipfinder.runelite.enabled`), keeps
   [trading history](homelab.md#trading-history) (`flipfinder.history.enabled`),
-  and turns on the chat, which calls the language model at `FLIPFINDER_LLM_URL`
-  (`flipfinder.llm.base-url`).
+  and turns on the chat (`flipfinder.llm.enabled`, from `FLIPFINDER_LLM_ENABLED`),
+  which calls the language model at `FLIPFINDER_LLM_URL`
+  (`flipfinder.llm.base-url`). The chat needs both: set
+  `FLIPFINDER_LLM_ENABLED=false` to run the homelab profile without it.
 
 Their settings are in
 [`application-local.properties`](../backend/src/main/resources/application-local.properties)
@@ -71,6 +73,11 @@ model through its Gateway:
 SPRING_PROFILES_ACTIVE=homelab FLIPFINDER_DB_PATH=flipfinder.db \
   FLIPFINDER_LLM_URL=http://llm.localhost:8080/v1 ./mvnw spring-boot:run
 ```
+
+The homelab runs its model only while an application
+[asks for it](homelab.md#starting-and-stopping-the-model), and a local backend
+does not, so start Flip Finder on the homelab too, or the model may be stopped.
+If it is starting, a question waits for it.
 
 The tests replace the model with a stub server, so `./mvnw verify` needs no
 homelab.

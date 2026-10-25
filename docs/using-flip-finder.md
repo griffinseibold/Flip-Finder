@@ -33,6 +33,10 @@ and the buy limits you have used. Answers use your coins as the budget unless
 you name one, stick to free-to-play items on a free-to-play account, and leave
 out what you have already bought this buy-limit window.
 
+The homelab starts its language model when Flip Finder starts, so the first
+answer after that can take up to a couple of minutes while the model loads; the
+chat says when it is waiting for it. Later answers start right away.
+
 The model looks flips up with the same ranking as the table, then summarizes
 the best few. **Based on N flips** under an answer opens the rows it read, so
 you can check its numbers. Language models can still misread or leave things

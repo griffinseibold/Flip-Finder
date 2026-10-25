@@ -23,6 +23,8 @@ from usual. Press Ctrl+C to stop it.
 The homelab version knows your account and adds a chat with the homelab's
 local language model: ask what to flip and it answers for your coins,
 membership and buy limits, and whether an item is trading more than usual.
+The homelab runs the model while Flip Finder runs, so the first answer after
+a start can wait a minute or two while it loads.
 You need:
 
 - a running [homelab]
@@ -54,8 +56,8 @@ then on, and its price database survives restarts.
 - [API](docs/api.md): the HTTP endpoints behind the web app.
 - [Development](docs/development.md): building, testing and running from
   source, with and without the homelab, and how releases work.
-- [Homelab deployment](docs/homelab.md): the Helm chart, Argo CD and how
-  updates reach the homelab.
+- [Homelab deployment](docs/homelab.md): the Helm chart, Argo CD, the
+  language model and how updates reach the homelab.
 - [RuneLite plugin](docs/runelite-plugin.md): setting up the plugin that tells
   the homelab version about your account.
 - [Price data](docs/price-data.md): where prices, trading volumes, buy limits

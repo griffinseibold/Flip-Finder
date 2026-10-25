@@ -22,13 +22,21 @@ The chart follows the homelab's application contract:
 - The `homelab` Spring profile stores SQLite on a 1 Gi `ReadWriteOnce`
   volume.
 - One replica runs, because a SQLite database has one writer.
+- The Deployment carries the `homelab.local/llm: requested` label, which asks
+  the homelab to run its [language model](#the-language-model) while Flip
+  Finder runs.
 
-Set `persistence.enabled=false` to run the in-memory `local` profile with no
-volume. Check the chart without deploying it:
+| Value | Default | What it does |
+| --- | --- | --- |
+| `persistence.enabled` | `true` | `false` runs the in-memory `local` profile with no volume, and with no chat |
+| `llm.enabled` | `true` | `false` turns the chat off and stops asking for the language model |
+
+Check the chart without deploying it:
 
 ```bash
 helm lint chart/flipfinder
 helm template flipfinder chart/flipfinder --namespace flipfinder
+helm template flipfinder chart/flipfinder --namespace flipfinder --set llm.enabled=false
 ```
 
 ## The language model
@@ -41,6 +49,38 @@ same query as `/api/flips` for the selected account, so it needs a model and
 server with tool calling; the homelab's Qwen3 does, with its thinking turned
 off to answer faster. The server's slots are shared with the homelab's other
 users, so an answer can wait while they are busy.
+
+### Starting and stopping the model
+
+The homelab does not keep its language model running: the model holds the GPU,
+so it runs only while an application asks for it. The chart asks for it with
+the `homelab.local/llm: requested` label on Flip Finder's Deployment. The
+homelab starts the model while Flip Finder runs and stops it a few minutes
+after Flip Finder stops or is scaled to zero.
+
+Loading the model takes up to a couple of minutes, so the first question after
+Flip Finder or the model starts may have to wait. Before it asks, Flip Finder
+checks the server's `/health`, at the root of the URL above without its `/v1`.
+While the model is loading, or not running yet, the chat says that the
+homelab's language model is starting and checks again every two seconds. The
+answer begins as soon as the model is ready. If it is still not ready after 90
+seconds, the chat says so and asks you to try again shortly.
+
+These settings change the wait:
+
+| Property | Default | What it does |
+| --- | --- | --- |
+| `flipfinder.llm.startup-wait` | `90s` | How long a question waits for the model to start. Keep it well under `spring.mvc.async.request-timeout` (3 minutes), so the answer has time to stream once the model is up. |
+| `flipfinder.llm.startup-poll` | `2s` | How often it checks whether the model is ready |
+| `flipfinder.llm.health-url` | The base URL's root plus `/health` | Where it checks, for a server laid out differently from llama.cpp |
+
+Set the chart's `llm.enabled` to `false` to turn the chat off. The label goes,
+so Flip Finder stops asking for the GPU and the homelab can stop the model, and
+the web app hides the chat. Everything else keeps working.
+
+The homelab also has an LLM mode, for using the model on its own: it stops the
+homelab's applications, Flip Finder among them, and runs only the model. Flip
+Finder starts again when the homelab leaves LLM mode.
 
 ## Trading history
 

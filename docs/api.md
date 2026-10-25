@@ -84,8 +84,9 @@ data.
 ## Chat
 
 `GET /api/features` returns `{"runelite": true, "history": true, "chat": true}`
-on the homelab; the standalone version has only `history`. The web app shows
-the chat only when `chat` is on.
+on the homelab; the standalone version has only `history`, and the homelab has
+no `chat` when the chart's `llm.enabled` is `false`. The web app shows the chat
+only when `chat` is on.
 
 `POST /api/chat` takes the conversation so far, oldest first and ending with
 the user's question, and optionally the account to answer for:
@@ -99,15 +100,17 @@ the user's question, and optionally the account to answer for:
 
 The server keeps no conversation: send the earlier messages each time. It
 answers with newline-delimited JSON (`application/x-ndjson`), one event per
-line, as the model works:
+line, as the model works. Ignore events of a `type` you do not know; new ones
+may be added.
 
 | `type` | Fields | Meaning |
 | --- | --- | --- |
+| `status` | `message` | The model is starting, and the answer waits for it; `message` says so in words |
 | `tool` | `name`, `search`, `budget` | The model is looking flips up |
 | `flips` | `search`, `budget`, `sort`, `total`, `items` | The flips it looked up, shaped like `/api/flips` results |
 | `history` | `search`, `history` | The item history it looked up, shaped like `/api/items/{id}/history`, or `null` when no item matched |
 | `text` | `text` | The next piece of the answer |
-| `error` | `message` | The model could not be reached or failed |
+| `error` | `message` | The model could not be reached, failed, or was still starting after the wait |
 | `done` | | The answer is complete |
 
 ```bash
