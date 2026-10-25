@@ -14,6 +14,16 @@ persistence:
   storageClassName: ""
   mountPath: /data
 
+# The chat, which answers with the homelab's language model. The homelab only
+# runs its model while an application asks for it, so while this is on the
+# Deployment carries the homelab.local/llm: requested label: the homelab starts
+# the model while Flip Finder runs and stops it a few minutes after Flip Finder
+# stops. Set enabled to false to turn the chat off and stop asking for the GPU.
+# Only the homelab profile (persistence.enabled) has a chat, so the in-memory
+# local profile never asks for the model.
+llm:
+  enabled: true
+
 # Labels applied to the release namespace so the homelab Gateway can admit the
 # HTTPRoute. Override these values when deploying to another platform.
 namespace:

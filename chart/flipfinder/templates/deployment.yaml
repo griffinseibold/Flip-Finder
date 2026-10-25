@@ -1,9 +1,17 @@
+{{- /* The chat needs the homelab profile, so the local profile never asks for the model. */}}
+{{- $llm := and .Values.llm.enabled .Values.persistence.enabled }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: {{ .Chart.Name }}
   labels:
     app.kubernetes.io/name: {{ .Chart.Name }}
+    {{- if $llm }}
+    # Asks the homelab to run its language model while this Deployment has
+    # replicas. It is on the Deployment only, not the pods or the selector, so
+    # turning it on or off never replaces the pod.
+    homelab.local/llm: requested
+    {{- end }}
 spec:
   replicas: {{ .Values.replicaCount }}
   strategy:
@@ -38,6 +46,9 @@ spec:
             - name: FLIPFINDER_DB_PATH
               value: {{ printf "%s/flipfinder.db" .Values.persistence.mountPath | quote }}
             {{- end }}
+            # Keeps the chat in step with the label: no label, no chat.
+            - name: FLIPFINDER_LLM_ENABLED
+              value: {{ $llm | toString | quote }}
           ports:
             - name: http
               containerPort: 8080
