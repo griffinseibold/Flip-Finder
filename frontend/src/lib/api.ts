@@ -228,6 +228,8 @@ export interface ItemHistory {
 }
 
 export type ChatEvent =
+  /** The answer is waiting for the homelab's language model to start. */
+  | { type: 'status'; message: string }
   | { type: 'tool'; name: string; search: string; budget: number | null }
   | { type: 'flips'; search: string; budget: number | null; sort: SortKey; total: number; items: Flip[] }
   | { type: 'history'; search: string; history: ItemHistory | null }
@@ -251,7 +253,33 @@ export async function streamChat(
   if (!response.ok || !response.body) {
     throw new Error(`POST /api/chat returned HTTP ${response.status}`);
   }
-  await readLines(response.body, (line) => onEvent(JSON.parse(line) as ChatEvent));
+  await readLines(response.body, (line) => {
+    const event = parseChatEvent(line);
+    if (event) {
+      onEvent(event);
+    }
+  });
+}
+
+const CHAT_EVENT_TYPES = new Set<string>(['status', 'tool', 'flips', 'history', 'text', 'error', 'done']);
+
+/**
+ * One line of the chat stream as an event, or null for anything else. A newer
+ * server may send kinds of event this version does not know; skipping them
+ * keeps an answer going instead of breaking it.
+ */
+export function parseChatEvent(line: string): ChatEvent | null {
+  let value: unknown;
+  try {
+    value = JSON.parse(line);
+  } catch {
+    return null;
+  }
+  if (typeof value !== 'object' || value === null) {
+    return null;
+  }
+  const type = (value as { type?: unknown }).type;
+  return typeof type === 'string' && CHAT_EVENT_TYPES.has(type) ? (value as ChatEvent) : null;
 }
 
 /** Calls onLine for each line of a streamed body, however the lines are split into chunks. */

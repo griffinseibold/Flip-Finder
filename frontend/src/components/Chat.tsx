@@ -14,6 +14,8 @@ interface Turn {
   lookups: Lookup[];
   /** What the assistant is doing before its answer starts. */
   status: string | null;
+  /** Shown while the answer waits for the language model to start; cleared once it is working. */
+  waiting: string | null;
   error: string | null;
   pending: boolean;
 }
@@ -60,8 +62,8 @@ export function Chat({ account, history }: { account: Account | null; history: b
     ];
     setTurns((current) => [
       ...current,
-      { role: 'user', content: question, lookups: [], status: null, error: null, pending: false },
-      { role: 'assistant', content: '', lookups: [], status: 'Thinking…', error: null, pending: true },
+      { role: 'user', content: question, lookups: [], status: null, waiting: null, error: null, pending: false },
+      { role: 'assistant', content: '', lookups: [], status: 'Thinking…', waiting: null, error: null, pending: true },
     ]);
     setDraft('');
 
@@ -70,18 +72,22 @@ export function Chat({ account, history }: { account: Account | null; history: b
     try {
       await streamChat(account?.accountHash ?? null, history, (event) => {
         switch (event.type) {
+          case 'status':
+            updateAnswer((turn) => ({ ...turn, waiting: event.message }));
+            break;
           case 'tool':
-            updateAnswer((turn) => ({ ...turn, status: lookupStatus(event) }));
+            updateAnswer((turn) => ({ ...turn, waiting: null, status: lookupStatus(event) }));
             break;
           case 'flips':
           case 'history':
             updateAnswer((turn) => ({ ...turn, lookups: [...turn.lookups, event] }));
             break;
           case 'text':
-            updateAnswer((turn) => ({ ...turn, status: null, content: turn.content + event.text }));
+            updateAnswer((turn) => ({ ...turn, status: null, waiting: null, content: turn.content + event.text }));
             break;
           case 'error':
-            updateAnswer((turn) => ({ ...turn, error: event.message }));
+            // The error says why the wait ended, so the note about waiting goes.
+            updateAnswer((turn) => ({ ...turn, waiting: null, error: event.message }));
             break;
           case 'done':
             break;
@@ -92,7 +98,7 @@ export function Chat({ account, history }: { account: Account | null; history: b
         updateAnswer((turn) => ({ ...turn, error: 'Could not reach Flip Finder.' }));
       }
     } finally {
-      updateAnswer((turn) => ({ ...turn, status: null, pending: false }));
+      updateAnswer((turn) => ({ ...turn, status: null, waiting: null, pending: false }));
     }
   };
 
@@ -141,6 +147,7 @@ export function Chat({ account, history }: { account: Account | null; history: b
             <div key={index} className="turn turn-assistant">
               {turn.content && <Markdown text={turn.content} />}
               {turn.status && <p className="chat-status">{turn.status}</p>}
+              {turn.waiting && <p className="chat-waiting">{turn.waiting}</p>}
               {turn.error && (
                 <p className="chat-error" role="alert">
                   {turn.error}

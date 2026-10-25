@@ -1014,6 +1014,14 @@ h3 {
   }
 }
 
+/* A note under "Thinking…" while the homelab's language model starts: quiet,
+   since the wait is expected and needs nothing from the player. */
+.chat-waiting {
+  margin: 0;
+  color: var(--ink-muted);
+  font-size: 12.5px;
+}
+
 .chat-error {
   margin: 0;
   color: var(--loss);
